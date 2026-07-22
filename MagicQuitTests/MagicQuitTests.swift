@@ -191,6 +191,63 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertNil(defaults.data(forKey: "com.MagicQuit.appIdleHours"))
     }
 
+    func testTimingSettingsDocumentRoundTrip() throws {
+        let settings = AppSettings(defaults: defaults)
+        settings.idleMinutes = 120
+        settings.setIdleMinutesOverride(30, forAppKey: "com.apple.Safari")
+        settings.setIdleMinutesOverride(60, forAppKey: "com.apple.mail")
+
+        let data = try JSONEncoder().encode(settings.timingSettingsDocument())
+        let decoded = try JSONDecoder().decode(TimingSettingsDocument.self, from: data)
+
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        let imported = AppSettings(defaults: defaults)
+        try imported.applyTimingSettingsDocument(decoded)
+
+        XCTAssertEqual(imported.idleMinutes, 120)
+        XCTAssertEqual(imported.idleMinutesOverride(forAppKey: "com.apple.Safari"), 30)
+        XCTAssertEqual(imported.idleMinutesOverride(forAppKey: "com.apple.mail"), 60)
+    }
+
+    func testTimingSettingsDocumentOmitsPathFallbacks() {
+        let settings = AppSettings(defaults: defaults)
+        settings.setIdleMinutesOverride(30, forAppKey: "/Applications/Example.app")
+        settings.setIdleMinutesOverride(60, forAppKey: "com.example.app")
+
+        XCTAssertEqual(
+            settings.timingSettingsDocument().apps,
+            [AppTimingSetting(appIdentifier: "com.example.app", idleMinutes: 60)]
+        )
+    }
+
+    func testTimingSettingsDocumentRejectsInvalidInput() throws {
+        let settings = AppSettings(defaults: defaults)
+
+        XCTAssertThrowsError(try settings.applyTimingSettingsDocument(TimingSettingsDocument(
+            version: 99,
+            defaultIdleMinutes: 60,
+            apps: []
+        )))
+        XCTAssertThrowsError(try settings.applyTimingSettingsDocument(TimingSettingsDocument(
+            version: TimingSettingsDocument.currentVersion,
+            defaultIdleMinutes: 61,
+            apps: []
+        )))
+        XCTAssertThrowsError(try settings.applyTimingSettingsDocument(TimingSettingsDocument(
+            version: TimingSettingsDocument.currentVersion,
+            defaultIdleMinutes: 60,
+            apps: [AppTimingSetting(appIdentifier: "/Applications/Example.app", idleMinutes: 60)]
+        )))
+        XCTAssertThrowsError(try settings.applyTimingSettingsDocument(TimingSettingsDocument(
+            version: TimingSettingsDocument.currentVersion,
+            defaultIdleMinutes: 60,
+            apps: [
+                AppTimingSetting(appIdentifier: "com.example.app", idleMinutes: 60),
+                AppTimingSetting(appIdentifier: "com.example.app", idleMinutes: 120),
+            ]
+        )))
+    }
+
     func testEmptiedWindowExclusionsStayEmpty() {
         let settings = AppSettings(defaults: defaults)
         for id in AppSettings.defaultWindowQuitExcluded {

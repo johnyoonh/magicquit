@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var selectedPage: SettingsPage = .general
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var accessibilityGranted = WindowWatcher.isTrusted
+    @State private var timingFileStatus: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -77,6 +78,27 @@ struct SettingsView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .frame(width: 96)
+                }
+
+                SettingsDivider()
+
+                SettingRow(
+                    icon: "doc.text",
+                    title: "App timing file",
+                    detail: "Back up or restore global and per-app idle durations as JSON."
+                ) {
+                    VStack(alignment: .trailing, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Button("Import…") { importTimingSettings() }
+                            Button("Export…") { exportTimingSettings() }
+                        }
+                        if let timingFileStatus {
+                            Text(timingFileStatus)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                 }
 
                 SettingsDivider()
@@ -207,6 +229,42 @@ struct SettingsView: View {
             if let bundleId = Bundle(url: url)?.bundleIdentifier {
                 settings.windowQuitExcluded.insert(bundleId)
             }
+        }
+    }
+
+    private func exportTimingSettings() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "MagicQuit-Timing.json"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(settings.timingSettingsDocument())
+            try data.write(to: url, options: .atomic)
+            timingFileStatus = "Exported \(url.lastPathComponent)"
+        } catch {
+            timingFileStatus = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func importTimingSettings() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let document = try JSONDecoder().decode(TimingSettingsDocument.self, from: data)
+            try settings.applyTimingSettingsDocument(document)
+            timingFileStatus = "Imported \(url.lastPathComponent)"
+        } catch {
+            timingFileStatus = "Import failed: \(error.localizedDescription)"
         }
     }
 
