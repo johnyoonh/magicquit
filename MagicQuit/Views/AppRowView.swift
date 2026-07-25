@@ -8,10 +8,17 @@ struct AppRowView: View {
     let entry: RunningAppsManager.TrackedApp
     let now: Date
 
-    private var isEnabled: Binding<Bool> {
+    private var idleEnabled: Binding<Bool> {
         Binding(
             get: { manager.isIdleQuitEnabled(entry.app) },
             set: { manager.setIdleQuitEnabled($0, for: entry.app) }
+        )
+    }
+
+    private var windowEnabled: Binding<Bool> {
+        Binding(
+            get: { manager.isWindowQuitEnabled(entry.app) },
+            set: { manager.setWindowQuitEnabled($0, for: entry.app) }
         )
     }
 
@@ -25,81 +32,117 @@ struct AppRowView: View {
     var body: some View {
         let idleMinutes = manager.idleMinutes(for: entry.app)
         let remaining = QuitPolicy.remainingSeconds(lastActive: entry.lastActive, now: now, idleMinutes: idleMinutes)
-        // Relative threshold so short idle durations are not permanently "closing soon"
-        let closingSoon = remaining < min(3600, idleMinutes * 15) && isEnabled.wrappedValue
+        let closingSoon = remaining < min(3600, idleMinutes * 15) && idleEnabled.wrappedValue
+        let pending = manager.pendingQuits[entry.id]
+        let appName = entry.app.localizedName ?? "Unknown"
 
-        HStack(spacing: 8) {
-            Toggle("", isOn: isEnabled)
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .disabled(!manager.canToggleIdleQuit(entry.app))
+        VStack(spacing: 5) {
+            HStack(spacing: 8) {
+                Image(nsImage: AppIconCache.icon(for: entry.app))
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 24, height: 24)
+                    .accessibilityHidden(true)
 
-            Image(nsImage: AppIconCache.icon(for: entry.app))
-                .resizable()
-                .scaledToFit()
-                .frame(width: 24, height: 24)
+                Text(appName)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fontWeight(closingSoon || pending != nil ? .semibold : .regular)
 
-            Text(entry.app.localizedName ?? "Unknown")
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .fontWeight(closingSoon ? .semibold : .regular)
-                .foregroundStyle(isEnabled.wrappedValue ? Color.primary : Color.secondary)
+                Spacer(minLength: 8)
 
-            Spacer(minLength: 8)
-
-            if isEnabled.wrappedValue {
-                Text(IdleDuration.shortRemaining(seconds: remaining))
-                    .monospacedDigit()
-                    .fontWeight(closingSoon ? .semibold : .regular)
-                    .foregroundStyle(closingSoon ? Color.primary : Color.secondary)
-            }
-
-            Picker("Idle duration", selection: idleDurationSelection) {
-                Text("Default").tag(0)
-                ForEach(IdleDuration.stepsInMinutes, id: \.self) { minutes in
-                    Text(IdleDuration.label(minutes: minutes)).tag(minutes)
+                if pending != nil {
+                    Text("Quitting soon")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if manager.terminationPending.contains(entry.id) {
+                    Text("Waiting…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if idleEnabled.wrappedValue {
+                    Text(IdleDuration.shortRemaining(seconds: remaining))
+                        .monospacedDigit()
+                        .fontWeight(closingSoon ? .semibold : .regular)
+                        .foregroundStyle(closingSoon ? Color.primary : Color.secondary)
                 }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(width: 82)
-            .help("Idle duration for \(entry.app.localizedName ?? "this app")")
 
-            Button {
-                manager.resetTimer(for: entry.id)
-            } label: {
-                Image(systemName: "arrow.uturn.backward.circle")
-            }
-            .buttonStyle(.plain)
-            .disabled(!isEnabled.wrappedValue)
+                Picker("Idle duration for \(appName)", selection: idleDurationSelection) {
+                    Text("Default").tag(0)
+                    ForEach(IdleDuration.stepsInMinutes, id: \.self) { minutes in
+                        Text(IdleDuration.label(minutes: minutes)).tag(minutes)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 82)
+                .disabled(!idleEnabled.wrappedValue)
 
-            if settings.showQuitButton {
                 Button {
-                    manager.quit(entry.app)
+                    manager.resetTimer(for: entry.id)
                 } label: {
-                    Image(systemName: "xmark.circle")
+                    Image(systemName: "arrow.uturn.backward.circle")
                 }
                 .buttonStyle(.plain)
+                .disabled(!idleEnabled.wrappedValue)
+                .accessibilityLabel("Reset idle timer for \(appName)")
+
+                if settings.showQuitButton {
+                    Button {
+                        manager.quit(entry.app)
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(manager.terminationPending.contains(entry.id))
+                    .accessibilityLabel("Quit \(appName)")
+                }
             }
+
+            HStack(spacing: 14) {
+                Toggle("Idle quit", isOn: idleEnabled)
+                    .toggleStyle(.checkbox)
+                    .disabled(!manager.canConfigure(entry.app))
+                    .accessibilityLabel("Automatically quit \(appName) when idle")
+
+                Toggle("Last-window quit", isOn: windowEnabled)
+                    .toggleStyle(.checkbox)
+                    .disabled(!manager.canConfigure(entry.app) || !settings.quitOnLastWindowClosed)
+                    .accessibilityLabel("Quit \(appName) when its last window closes")
+
+                Spacer()
+
+                if pending != nil {
+                    Button("Cancel") { manager.cancelPendingQuit(for: entry.id) }
+                        .controlSize(.small)
+                    Button("Snooze 15 min") { manager.snoozePendingQuit(for: entry.id) }
+                        .controlSize(.small)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 2)
+        .padding(.vertical, 5)
     }
-
 }
 
 /// Icon lookups are not cheap; the menu re-renders every second while open.
 @MainActor
 enum AppIconCache {
-    private static var cache: [String: NSImage] = [:]
+    private static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 256
+        return cache
+    }()
 
     static func icon(for app: NSRunningApplication) -> NSImage {
-        let path = app.bundleURL?.path ?? app.executableURL?.path ?? ""
-        if let cached = cache[path] {
-            return cached
+        guard let path = app.bundleURL?.path ?? app.executableURL?.path, !path.isEmpty else {
+            return NSWorkspace.shared.icon(for: .applicationBundle)
         }
+        let key = path as NSString
+        if let cached = cache.object(forKey: key) { return cached }
         let icon = NSWorkspace.shared.icon(forFile: path)
-        cache[path] = icon
+        cache.setObject(icon, forKey: key)
         return icon
     }
 }
