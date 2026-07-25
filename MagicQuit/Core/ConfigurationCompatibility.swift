@@ -60,13 +60,14 @@ extension AppSettings {
             version: TimingSettingsDocument.currentVersion,
             defaultIdleMinutes: idleMinutes,
             apps: perAppIdleMinutes
+                .filter { !$0.key.contains("/") }
                 .map { AppTimingSetting(appIdentifier: $0.key, idleMinutes: $0.value) }
                 .sorted { $0.appIdentifier < $1.appIdentifier },
             showQuitButton: showQuitButton,
             quitOnLastWindowClosed: quitOnLastWindowClosed,
             warnBeforeQuitting: warnBeforeQuitting,
-            idleQuitExcluded: idleQuitExcluded.sorted(),
-            windowQuitExcluded: windowQuitExcluded.sorted()
+            idleQuitExcluded: idleQuitExcluded.filter { !$0.contains("/") }.sorted(),
+            windowQuitExcluded: windowQuitExcluded.filter { !$0.contains("/") }.sorted()
         )
     }
 
@@ -81,7 +82,8 @@ extension AppSettings {
         var overrides: [String: Int] = [:]
         for app in document.apps {
             let identifier = app.appIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !identifier.isEmpty, identifier.count <= 1_024, !identifier.contains("\0") else {
+            guard !identifier.isEmpty, identifier.count <= 1_024,
+                  !identifier.contains("\0"), !identifier.contains("/") else {
                 throw TimingSettingsDocumentError.invalidAppIdentifier(app.appIdentifier)
             }
             guard IdleDuration.stepsInMinutes.contains(app.idleMinutes) else {
