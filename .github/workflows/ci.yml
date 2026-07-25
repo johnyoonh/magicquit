@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject stale upstream distribution references
+        run: |
+          if git grep -n 'BigBerny/magicquit' -- README.md MagicQuit scripts packaging RELEASING.md appcast.xml; then
+            echo 'Found stale upstream distribution reference' >&2
+            exit 1
+          fi
+      - name: Validate property lists
+        run: plutil -lint MagicQuit/Info.plist MagicQuit/MagicQuit.entitlements scripts/ExportOptions.plist
+      - name: Build Debug
+        run: xcodebuild build -project MagicQuit.xcodeproj -scheme MagicQuit -configuration Debug CODE_SIGNING_ALLOWED=NO
+      - name: Build Release
+        run: xcodebuild build -project MagicQuit.xcodeproj -scheme MagicQuit -configuration Release CODE_SIGNING_ALLOWED=NO
+      - name: Unit tests
+        run: xcodebuild test -project MagicQuit.xcodeproj -scheme MagicQuit -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+      - name: Validate release script
+        run: bash -n scripts/release.sh
+      - name: Validate cask updater
+        run: python3 -m py_compile scripts/update_cask.py
