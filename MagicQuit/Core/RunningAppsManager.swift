@@ -11,7 +11,23 @@ final class RunningAppsManager: ObservableObject {
         var id: pid_t { app.processIdentifier }
     }
 
+    struct PendingQuit: Identifiable {
+        let pid: pid_t
+        let appName: String
+        let requestedAt: Date
+        let deadline: Date
+        var id: pid_t { pid }
+    }
+
+    private enum PauseReason: Hashable {
+        case sleeping
+        case screenLocked
+        case sessionInactive
+    }
+
     @Published private(set) var tracked: [pid_t: TrackedApp] = [:]
+    @Published private(set) var pendingQuits: [pid_t: PendingQuit] = [:]
+    @Published private(set) var terminationPending: Set<pid_t> = []
 
     let settings: AppSettings
     let windowWatcher: WindowWatcher
@@ -20,15 +36,19 @@ final class RunningAppsManager: ObservableObject {
     private var dueTimer: Timer?
     private var observerTokens: [NSObjectProtocol] = []
     private var distributedTokens: [NSObjectProtocol] = []
-    /// Set while the machine is asleep or the screen is locked; that time is not counted as idle.
+    private var pauseReasons: Set<PauseReason> = []
     private var pauseStarted: Date?
     private var cancellables: Set<AnyCancellable> = []
+    private var quitTasks: [pid_t: Task<Void, Never>] = [:]
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.MagicQuit", category: "RunningAppsManager")
+
+    static let warningDuration: TimeInterval = 30
+    static let terminationRetryInterval: TimeInterval = 30
 
     init(settings: AppSettings) {
         self.settings = settings
         self.windowWatcher = WindowWatcher(settings: settings)
-        windowWatcher.terminateHandler = { [weak self] app in self?.quit(app) }
+        windowWatcher.terminateHandler = { [weak self] app in self?.requestQuit(app, reason: "last window closed") }
 
         reconcile()
 
@@ -44,21 +64,27 @@ final class RunningAppsManager: ObservableObject {
         observeApp(NSWorkspace.didActivateApplicationNotification) { [weak self] app in self?.touch(app) }
         observeApp(NSWorkspace.didDeactivateApplicationNotification) { [weak self] app in self?.touch(app) }
         observeApp(NSWorkspace.didLaunchApplicationNotification) { [weak self] app in self?.track(app) }
-        observeApp(NSWorkspace.didTerminateApplicationNotification) { [weak self] app in self?.untrack(app) }
+        observeApp(NSWorkspace.didTerminateApplicationNotification) { [weak self] app in self?.confirmTermination(app) }
 
         observerTokens.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
-            Task { @MainActor [weak self] in self?.pauseTimers() }
+            Task { @MainActor [weak self] in self?.beginPause(.sleeping) }
         })
         observerTokens.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-            Task { @MainActor [weak self] in self?.creditPausedTime() }
+            Task { @MainActor [weak self] in self?.endPause(.sleeping) }
+        })
+        observerTokens.append(center.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor [weak self] in self?.beginPause(.sessionInactive) }
+        })
+        observerTokens.append(center.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor [weak self] in self?.endPause(.sessionInactive) }
         })
 
         let distributed = DistributedNotificationCenter.default()
         distributedTokens.append(distributed.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { _ in
-            Task { @MainActor [weak self] in self?.pauseTimers() }
+            Task { @MainActor [weak self] in self?.beginPause(.screenLocked) }
         })
         distributedTokens.append(distributed.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in
-            Task { @MainActor [weak self] in self?.creditPausedTime() }
+            Task { @MainActor [weak self] in self?.endPause(.screenLocked) }
         })
 
         sweepTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
@@ -79,14 +105,11 @@ final class RunningAppsManager: ObservableObject {
     deinit {
         sweepTimer?.invalidate()
         dueTimer?.invalidate()
+        quitTasks.values.forEach { $0.cancel() }
         let center = NSWorkspace.shared.notificationCenter
-        for token in observerTokens {
-            center.removeObserver(token)
-        }
+        observerTokens.forEach(center.removeObserver)
         let distributed = DistributedNotificationCenter.default()
-        for token in distributedTokens {
-            distributed.removeObserver(token)
-        }
+        distributedTokens.forEach(distributed.removeObserver)
     }
 
     // MARK: - Tracking
@@ -103,14 +126,20 @@ final class RunningAppsManager: ObservableObject {
         windowWatcher.watch(app)
     }
 
-    private func untrack(_ app: NSRunningApplication) {
-        tracked[app.processIdentifier] = nil
-        windowWatcher.unwatch(app.processIdentifier)
+    private func confirmTermination(_ app: NSRunningApplication) {
+        let pid = app.processIdentifier
+        tracked[pid] = nil
+        pendingQuits[pid] = nil
+        terminationPending.remove(pid)
+        quitTasks[pid]?.cancel()
+        quitTasks[pid] = nil
+        windowWatcher.unwatch(pid)
     }
 
     private func touch(_ app: NSRunningApplication) {
         track(app)
         tracked[app.processIdentifier]?.lastActive = Date()
+        cancelPendingQuit(for: app.processIdentifier)
     }
 
     private func reconcile() {
@@ -120,27 +149,27 @@ final class RunningAppsManager: ObservableObject {
         for (pid, entry) in tracked {
             let gone = !runningPids.contains(pid) || entry.app.isTerminated
             let untrackable = !QuitPolicy.isTrackable(bundleId: entry.app.bundleIdentifier,
-                                                      activationPolicy: entry.app.activationPolicy,
-                                                      ownBundleId: Bundle.main.bundleIdentifier)
+                                                       activationPolicy: entry.app.activationPolicy,
+                                                       ownBundleId: Bundle.main.bundleIdentifier)
             if gone || untrackable {
-                tracked[pid] = nil
-                windowWatcher.unwatch(pid)
+                confirmTermination(entry.app)
             }
         }
 
-        for app in running {
-            track(app)
-        }
+        for app in running { track(app) }
     }
 
-    private func pauseTimers() {
-        if pauseStarted == nil {
-            pauseStarted = Date()
-        }
+    // MARK: - Pausing
+
+    private func beginPause(_ reason: PauseReason) {
+        if pauseReasons.isEmpty { pauseStarted = Date() }
+        pauseReasons.insert(reason)
+        cancelAllPendingQuits()
     }
 
-    private func creditPausedTime() {
-        guard let start = pauseStarted else { return }
+    private func endPause(_ reason: PauseReason) {
+        pauseReasons.remove(reason)
+        guard pauseReasons.isEmpty, let start = pauseStarted else { return }
         pauseStarted = nil
         let paused = Date().timeIntervalSince(start)
         guard paused > 0 else { return }
@@ -156,33 +185,29 @@ final class RunningAppsManager: ObservableObject {
 
     func sweep() {
         reconcile()
-        if let frontmost = NSWorkspace.shared.frontmostApplication {
-            touch(frontmost)
-        }
+        if let frontmost = NSWorkspace.shared.frontmostApplication { touch(frontmost) }
         windowWatcher.refresh(apps: tracked.values.map(\.app))
 
-        // Never quit while asleep/locked — paused time is credited back on unlock.
-        guard pauseStarted == nil else { return }
+        guard pauseReasons.isEmpty else { return }
 
         let now = Date()
         for entry in tracked.values {
             let idleMinutes = idleMinutes(for: entry.app)
             guard entry.app.isFinishedLaunching,
                   isIdleQuitEnabled(entry.app),
+                  !terminationPending.contains(entry.id),
                   QuitPolicy.idleQuitDue(lastActive: entry.lastActive, now: now, idleMinutes: idleMinutes)
             else { continue }
-            quit(entry.app)
+            requestQuit(entry.app, reason: "idle for \(idleMinutes) minutes")
         }
         scheduleDueCheck(now: now)
     }
 
-    /// The sweep runs every 30s; when an app is due sooner, fire once exactly then
-    /// so the menu countdown never sits at "0 s" waiting for the next sweep.
     private func scheduleDueCheck(now: Date) {
         dueTimer?.invalidate()
         dueTimer = nil
         let soonest = tracked.values
-            .filter { isIdleQuitEnabled($0.app) }
+            .filter { isIdleQuitEnabled($0.app) && !terminationPending.contains($0.id) }
             .map {
                 QuitPolicy.remainingSeconds(
                     lastActive: $0.lastActive,
@@ -197,32 +222,106 @@ final class RunningAppsManager: ObservableObject {
         }
     }
 
-    func quit(_ app: NSRunningApplication) {
-        log.debug("Quitting \(app.localizedName ?? "unknown", privacy: .public)")
-        if app.terminate() {
-            untrack(app)
+    func requestQuit(_ app: NSRunningApplication, reason: String = "manual") {
+        let pid = app.processIdentifier
+        guard !app.isTerminated, !terminationPending.contains(pid), pendingQuits[pid] == nil else { return }
+
+        if settings.warnBeforeQuitting && reason != "manual" {
+            let deadline = Date().addingTimeInterval(Self.warningDuration)
+            pendingQuits[pid] = PendingQuit(
+                pid: pid,
+                appName: app.localizedName ?? "Unknown app",
+                requestedAt: Date(),
+                deadline: deadline
+            )
+            quitTasks[pid] = Task { @MainActor [weak self, weak app] in
+                try? await Task.sleep(for: .seconds(Self.warningDuration))
+                guard !Task.isCancelled, let self, let app, self.pendingQuits[pid] != nil else { return }
+                self.pendingQuits[pid] = nil
+                self.performTermination(app, reason: reason)
+            }
+        } else {
+            performTermination(app, reason: reason)
         }
     }
 
-    func resetTimer(for pid: pid_t) {
+    private func performTermination(_ app: NSRunningApplication, reason: String) {
+        let pid = app.processIdentifier
+        pendingQuits[pid] = nil
+        quitTasks[pid]?.cancel()
+        quitTasks[pid] = nil
+        guard !app.isTerminated else {
+            confirmTermination(app)
+            return
+        }
+
+        log.info("Requesting quit for \(app.localizedName ?? "unknown", privacy: .private); reason: \(reason, privacy: .private)")
+        guard app.terminate() else { return }
+        terminationPending.insert(pid)
+
+        quitTasks[pid] = Task { @MainActor [weak self, weak app] in
+            try? await Task.sleep(for: .seconds(Self.terminationRetryInterval))
+            guard !Task.isCancelled, let self, let app else { return }
+            if app.isTerminated {
+                self.confirmTermination(app)
+            } else {
+                // The app may have displayed a save prompt or refused termination.
+                // Keep tracking it and allow a later/manual request.
+                self.terminationPending.remove(pid)
+                self.tracked[pid]?.lastActive = Date()
+                self.quitTasks[pid] = nil
+            }
+        }
+    }
+
+    func cancelPendingQuit(for pid: pid_t) {
+        pendingQuits[pid] = nil
+        quitTasks[pid]?.cancel()
+        quitTasks[pid] = nil
         tracked[pid]?.lastActive = Date()
     }
 
-    // MARK: - Per-app exclusion ("never quit this app")
+    func snoozePendingQuit(for pid: pid_t, minutes: Int = 15) {
+        cancelPendingQuit(for: pid)
+        tracked[pid]?.lastActive = Date().addingTimeInterval(TimeInterval(minutes * 60 - idleMinutesForPID(pid) * 60))
+    }
 
-    /// Stable per-app key; falls back to the executable path for the rare app
-    /// without a bundle identifier so its checkbox still works.
+    private func cancelAllPendingQuits() {
+        for pid in pendingQuits.keys { cancelPendingQuit(for: pid) }
+    }
+
+    private func idleMinutesForPID(_ pid: pid_t) -> Int {
+        guard let app = tracked[pid]?.app else { return settings.idleMinutes }
+        return idleMinutes(for: app)
+    }
+
+    func quit(_ app: NSRunningApplication) {
+        requestQuit(app, reason: "manual")
+    }
+
+    func resetTimer(for pid: pid_t) {
+        cancelPendingQuit(for: pid)
+        tracked[pid]?.lastActive = Date()
+    }
+
+    // MARK: - Per-app policies
+
     private func exclusionKey(for app: NSRunningApplication) -> String? {
         app.bundleIdentifier ?? app.executableURL?.path
     }
 
-    func canToggleIdleQuit(_ app: NSRunningApplication) -> Bool {
+    func canConfigure(_ app: NSRunningApplication) -> Bool {
         exclusionKey(for: app) != nil
     }
 
     func isIdleQuitEnabled(_ app: NSRunningApplication) -> Bool {
-        guard let key = exclusionKey(for: app) else { return true }
+        guard let key = exclusionKey(for: app) else { return false }
         return !settings.idleQuitExcluded.contains(key)
+    }
+
+    func isWindowQuitEnabled(_ app: NSRunningApplication) -> Bool {
+        guard let key = exclusionKey(for: app) else { return false }
+        return !settings.windowQuitExcluded.contains(key)
     }
 
     func setIdleQuitEnabled(_ enabled: Bool, for app: NSRunningApplication) {
@@ -232,7 +331,18 @@ final class RunningAppsManager: ObservableObject {
             resetTimer(for: app.processIdentifier)
         } else {
             settings.idleQuitExcluded.insert(key)
+            cancelPendingQuit(for: app.processIdentifier)
         }
+    }
+
+    func setWindowQuitEnabled(_ enabled: Bool, for app: NSRunningApplication) {
+        guard let key = exclusionKey(for: app) else { return }
+        if enabled {
+            settings.windowQuitExcluded.remove(key)
+        } else {
+            settings.windowQuitExcluded.insert(key)
+        }
+        windowWatcher.refresh(apps: tracked.values.map(\.app))
     }
 
     func idleMinutes(for app: NSRunningApplication) -> Int {
