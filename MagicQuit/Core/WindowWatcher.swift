@@ -3,9 +3,6 @@ import ApplicationServices
 import os.log
 
 /// Quits an app once its last window closes, using the Accessibility API.
-///
-/// The AX route is deliberate: CGWindowList does not report minimized windows,
-/// which would make apps with only minimized windows look windowless.
 @MainActor
 final class WindowWatcher {
     var terminateHandler: ((NSRunningApplication) -> Void)?
@@ -23,7 +20,6 @@ final class WindowWatcher {
     private var loggedActive: Bool?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.MagicQuit", category: "WindowWatcher")
 
-    /// Grace period between the destroy event and the final window-count check.
     static let quitDelay: TimeInterval = 2
 
     static var isTrusted: Bool { AXIsProcessTrusted() }
@@ -39,33 +35,22 @@ final class WindowWatcher {
         self.settings = settings
     }
 
-    /// Reconcile watches with the desired state; called from the manager's sweep and on setting changes.
-    /// Also retries apps whose registration failed earlier (no Watch entry yet) and
-    /// re-scans watches that have not seen a window so far.
     func refresh(apps: [NSRunningApplication]) {
         let isActive = active
         if loggedActive != isActive {
             loggedActive = isActive
-            log.info("window-close watcher \(isActive ? "active" : "inactive", privacy: .public) (setting \(self.settings.quitOnLastWindowClosed ? "on" : "off", privacy: .public), accessibility \(Self.isTrusted ? "granted" : "missing", privacy: .public))")
+            log.info("window-close watcher \(isActive ? "active" : "inactive", privacy: .public)")
         }
         guard isActive else {
-            for pid in Array(watches.keys) {
-                unwatch(pid)
-            }
+            for pid in Array(watches.keys) { unwatch(pid) }
             return
         }
-        for app in apps {
-            watch(app)
-        }
+        for app in apps { watch(app) }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         for (pid, watch) in watches {
             let windows = Self.windowList(of: watch.element)
             if watch.hadWindows {
-                // Self-healing fallback: if the destroyed event was missed for any
-                // reason, the periodic sweep still notices the app went windowless.
-                if windows.isEmpty {
-                    scheduleWindowCountCheck(pid: pid, generation: watch.generation)
-                }
+                if windows.isEmpty { scheduleWindowCountCheck(pid: pid, generation: watch.generation) }
             } else if !windows.isEmpty {
                 for window in windows {
                     AXObserverAddNotification(watch.observer, window, kAXUIElementDestroyedNotification as CFString, refcon)
@@ -78,9 +63,6 @@ final class WindowWatcher {
     func watch(_ app: NSRunningApplication) {
         guard active else { return }
         let pid = app.processIdentifier
-        // No entry is stored unless registration succeeds, so failed attempts
-        // (e.g. the app's AX server not being ready during launch) are retried
-        // by the next refresh().
         guard watches[pid] == nil, pid > 0, app.isFinishedLaunching else { return }
 
         var observer: AXObserver?
@@ -116,16 +98,15 @@ final class WindowWatcher {
                 let refcon = Unmanaged.passUnretained(self).toOpaque()
                 AXObserverAddNotification(watch.observer, element, kAXUIElementDestroyedNotification as CFString, refcon)
             }
-        } else if notification == (kAXUIElementDestroyedNotification as String) {
-            if let generation = watches[pid]?.generation {
-                scheduleWindowCountCheck(pid: pid, generation: generation)
-            }
+        } else if notification == (kAXUIElementDestroyedNotification as String),
+                  let generation = watches[pid]?.generation {
+            scheduleWindowCountCheck(pid: pid, generation: generation)
         }
     }
 
     private func scheduleWindowCountCheck(pid: pid_t, generation: Int) {
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.quitDelay * 1_000_000_000))
+            try? await Task.sleep(for: .seconds(Self.quitDelay))
             self?.checkWindowCount(pid: pid, generation: generation)
         }
     }
@@ -137,33 +118,21 @@ final class WindowWatcher {
             return
         }
         let name = app.localizedName ?? "unknown"
-        // The menu checkbox means "never quit this app" — it protects against
-        // both quit mechanisms, matching what it meant in 1.x.
         if let key = app.bundleIdentifier ?? app.executableURL?.path,
-           settings.windowQuitExcluded.contains(key) || settings.idleQuitExcluded.contains(key) {
-            log.debug("windowCheck \(name, privacy: .public): excluded")
+           settings.windowQuitExcluded.contains(key) {
+            log.debug("window check excluded: \(name, privacy: .private)")
             return
         }
         guard app.isFinishedLaunching else { return }
-        // Splash screens and staged launches: never window-quit a freshly launched app.
-        if let launched = app.launchDate, Date().timeIntervalSince(launched) < 30 {
-            log.debug("windowCheck \(name, privacy: .public): too young")
-            return
-        }
-        let axCount = Self.windowList(of: watch.element).count
-        guard axCount == 0 else {
-            log.debug("windowCheck \(name, privacy: .public): \(axCount) AX windows")
-            return
-        }
-        // AX does not report windows on inactive Spaces (incl. full-screen windows);
-        // cross-check with CGWindowList, which sees all Spaces, before quitting.
-        let cgCount = Self.cgWindowCount(pid: pid)
-        guard cgCount == 0 else {
-            log.debug("windowCheck \(name, privacy: .public): \(cgCount) CG windows")
-            return
-        }
+        if let launched = app.launchDate, Date().timeIntervalSince(launched) < 30 { return }
 
-        log.info("Last window closed: \(name, privacy: .public)")
+        let axCount = Self.windowList(of: watch.element).count
+        guard axCount == 0 else { return }
+
+        let cgCount = Self.cgWindowCount(pid: pid)
+        guard cgCount == 0 else { return }
+
+        log.info("Last window closed for \(name, privacy: .private)")
         terminateHandler?(app)
     }
 
@@ -171,13 +140,9 @@ final class WindowWatcher {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value) == .success,
               let value, CFGetTypeID(value) == CFArrayGetTypeID() else { return [] }
-        return (value as! [AXUIElement])
+        return value as! [AXUIElement]
     }
 
-    /// Counts real windows only: on-screen, or off-screen with substantial bounds
-    /// and visible alpha (windows on other Spaces and minimized windows keep both).
-    /// Tiny/transparent off-screen helper windows some apps keep alive must not
-    /// block quitting.
     private static func cgWindowCount(pid: pid_t) -> Int {
         guard let list = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] else { return 0 }
         return list.count { info in
@@ -186,9 +151,7 @@ final class WindowWatcher {
             if (info[kCGWindowIsOnscreen as String] as? Bool) == true { return true }
             let alpha = (info[kCGWindowAlpha as String] as? Double) ?? 0
             let bounds = (info[kCGWindowBounds as String] as? [String: Double]) ?? [:]
-            let width = bounds["Width"] ?? 0
-            let height = bounds["Height"] ?? 0
-            return alpha > 0 && width >= 64 && height >= 64
+            return alpha > 0 && (bounds["Width"] ?? 0) >= 64 && (bounds["Height"] ?? 0) >= 64
         }
     }
 }
@@ -196,8 +159,7 @@ final class WindowWatcher {
 private func windowWatcherCallback(observer: AXObserver, element: AXUIElement, notification: CFString, refcon: UnsafeMutableRawPointer?) {
     guard let refcon else { return }
     let watcher = Unmanaged<WindowWatcher>.fromOpaque(refcon).takeUnretainedValue()
-    let name = notification as String
     MainActor.assumeIsolated {
-        watcher.handle(notification: name, element: element)
+        watcher.handle(notification: notification as String, element: element)
     }
 }
