@@ -1,16 +1,15 @@
-# Draft cask for homebrew/homebrew-cask (or a personal tap).
-# Update version + sha256 after each release (scripts/release.sh prints the sha).
+# Draft cask for homebrew/homebrew-cask or a personal tap.
 cask "magicquit" do
-  version "2.0"
-  sha256 "eb7a42caa1318d977750d3421bbc13a34bc0694f35aeb3d010ec190dd6e0553f"
+  version "2.0.1"
+  sha256 :no_check
 
-  url "https://github.com/BigBerny/magicquit/releases/download/v#{version}/MagicQuit-#{version}.zip"
+  url "https://github.com/johnyoonh/magicquit/releases/download/v#{version}/MagicQuit-#{version}.zip"
   name "MagicQuit"
   desc "Automatically quits apps that are idle or whose last window was closed"
-  homepage "https://github.com/BigBerny/magicquit"
+  homepage "https://github.com/johnyoonh/magicquit"
 
   livecheck do
-    url "https://github.com/BigBerny/magicquit"
+    url :url
     strategy :github_latest
   end
 
@@ -21,5 +20,6 @@ cask "magicquit" do
 
   zap trash: [
     "~/Library/Preferences/com.MagicQuit.plist",
+    "~/Library/Application Support/MagicQuit",
   ]
 end
