@@ -60,13 +60,14 @@ final class WindowWatcher {
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         for (pid, watch) in watches {
             let windows = Self.windowList(of: watch.element)
+            let anyOpen = !windows.isEmpty || Self.cgWindowCount(pid: pid) > 0
             if watch.hadWindows {
                 // Self-healing fallback: if the destroyed event was missed for any
                 // reason, the periodic sweep still notices the app went windowless.
-                if windows.isEmpty {
+                if !anyOpen {
                     scheduleWindowCountCheck(pid: pid, generation: watch.generation)
                 }
-            } else if !windows.isEmpty {
+            } else if anyOpen {
                 for window in windows {
                     AXObserverAddNotification(watch.observer, window, kAXUIElementDestroyedNotification as CFString, refcon)
                 }
@@ -96,7 +97,12 @@ final class WindowWatcher {
             AXObserverAddNotification(observer, window, kAXUIElementDestroyedNotification as CFString, refcon)
         }
         nextGeneration += 1
-        watches[pid] = Watch(observer: observer, element: element, hadWindows: !windows.isEmpty, generation: nextGeneration)
+        watches[pid] = Watch(
+            observer: observer,
+            element: element,
+            hadWindows: Self.hasAnyWindows(pid: pid, element: element),
+            generation: nextGeneration
+        )
     }
 
     func unwatch(_ pid: pid_t) {
@@ -164,7 +170,12 @@ final class WindowWatcher {
         }
 
         log.info("Last window closed: \(name, privacy: .public)")
+        watches[pid]?.hadWindows = false
         terminateHandler?(app)
+    }
+
+    private static func hasAnyWindows(pid: pid_t, element: AXUIElement) -> Bool {
+        !windowList(of: element).isEmpty || cgWindowCount(pid: pid) > 0
     }
 
     private static func windowList(of element: AXUIElement) -> [AXUIElement] {

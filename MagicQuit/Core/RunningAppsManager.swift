@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CoreGraphics
 import os.log
 
 /// Tracks regular apps and quits them once they have been idle for the configured duration.
@@ -154,9 +155,14 @@ final class RunningAppsManager: ObservableObject {
 
     // MARK: - Quitting
 
+    private static func systemIdleSeconds() -> TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null)
+    }
+
     func sweep() {
         reconcile()
-        if let frontmost = NSWorkspace.shared.frontmostApplication {
+        if Self.systemIdleSeconds() < 30,
+           let frontmost = NSWorkspace.shared.frontmostApplication {
             touch(frontmost)
         }
         windowWatcher.refresh(apps: tracked.values.map(\.app))

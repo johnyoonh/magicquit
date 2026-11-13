@@ -3,17 +3,20 @@ import XCTest
 
 final class IdleDurationTests: XCTestCase {
     func testStepsAreAscendingAndBounded() {
-        XCTAssertEqual(IdleDuration.stepsInMinutes.first, 15)
+        XCTAssertEqual(IdleDuration.stepsInMinutes.first, 5)
         XCTAssertEqual(IdleDuration.stepsInMinutes.last, 2880)
         XCTAssertEqual(IdleDuration.stepsInMinutes, IdleDuration.stepsInMinutes.sorted())
         XCTAssertTrue(IdleDuration.stepsInMinutes.contains(IdleDuration.defaultMinutes))
+        XCTAssertEqual(IdleDuration.defaultMinutes, 120)
     }
 
     func testStepAtLeast() {
-        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 0), 15)
+        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 0), 5)
         // Migration must never shorten a configured duration
-        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 90), 120)
-        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 3 * 60), 240)
+        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 70), 90)
+        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 90), 90)
+        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 3 * 60), 180)
+        XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 5 * 60), 360)
         XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 500), 720)
         // ...except beyond the largest step, which clamps
         XCTAssertEqual(IdleDuration.stepAtLeast(minutes: 72 * 60), 2880)
@@ -23,23 +26,26 @@ final class IdleDurationTests: XCTestCase {
     }
 
     func testStepUpAndDown() {
-        XCTAssertEqual(IdleDuration.stepUp(from: 15), 30)
-        XCTAssertEqual(IdleDuration.stepDown(from: 30), 15)
-        XCTAssertEqual(IdleDuration.stepDown(from: 15), 15)
+        XCTAssertEqual(IdleDuration.stepUp(from: 5), 10)
+        XCTAssertEqual(IdleDuration.stepDown(from: 10), 5)
+        XCTAssertEqual(IdleDuration.stepDown(from: 5), 5)
         XCTAssertEqual(IdleDuration.stepUp(from: 2880), 2880)
         XCTAssertEqual(IdleDuration.stepUp(from: 100), 120)
-        XCTAssertEqual(IdleDuration.stepDown(from: 100), 60)
+        XCTAssertEqual(IdleDuration.stepDown(from: 100), 90)
     }
 
     func testLabels() {
+        XCTAssertEqual(IdleDuration.label(minutes: 5), "5 min")
         XCTAssertEqual(IdleDuration.label(minutes: 15), "15 min")
         XCTAssertEqual(IdleDuration.label(minutes: 30), "30 min")
         XCTAssertEqual(IdleDuration.label(minutes: 60), "1 h")
+        XCTAssertEqual(IdleDuration.label(minutes: 90), "1h 30m")
         XCTAssertEqual(IdleDuration.label(minutes: 2880), "48 h")
     }
 
     func testShortRemaining() {
         XCTAssertEqual(IdleDuration.shortRemaining(seconds: 7200), "2 h")
+        XCTAssertEqual(IdleDuration.shortRemaining(seconds: 5400), "1h 30m")
         XCTAssertEqual(IdleDuration.shortRemaining(seconds: 3599), "59 min")
         XCTAssertEqual(IdleDuration.shortRemaining(seconds: 59), "59 s")
         XCTAssertEqual(IdleDuration.shortRemaining(seconds: -5), "0 s")
@@ -133,9 +139,9 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(AppSettings(defaults: defaults).idleMinutes, 480)
 
         // Non-step values round UP so apps never quit earlier than configured
-        defaults.set(3, forKey: "hoursUntilClose")
+        defaults.set(5, forKey: "hoursUntilClose")
         defaults.removeObject(forKey: "idleMinutes")
-        XCTAssertEqual(AppSettings(defaults: defaults).idleMinutes, 240)
+        XCTAssertEqual(AppSettings(defaults: defaults).idleMinutes, 360)
 
         defaults.set(72, forKey: "hoursUntilClose")
         defaults.removeObject(forKey: "idleMinutes")
@@ -198,18 +204,20 @@ final class AppSettingsTests: XCTestCase {
 
     func testPerAppIdleDurationRoundsUpToSupportedStep() {
         let settings = AppSettings(defaults: defaults)
-        settings.setIdleMinutesOverride(90, forAppKey: "com.apple.Safari")
-        XCTAssertEqual(settings.idleMinutesOverride(forAppKey: "com.apple.Safari"), 120)
+        settings.setIdleMinutesOverride(70, forAppKey: "com.apple.Safari")
+        XCTAssertEqual(settings.idleMinutesOverride(forAppKey: "com.apple.Safari"), 90)
+        settings.setIdleMinutesOverride(95, forAppKey: "com.apple.mail")
+        XCTAssertEqual(settings.idleMinutesOverride(forAppKey: "com.apple.mail"), 120)
     }
 
     func testLegacyPerAppIdleHoursMigration() throws {
-        let legacy = ["Safari": 3]
+        let legacy = ["Safari": 5]
         defaults.set(try JSONEncoder().encode(legacy), forKey: "com.MagicQuit.appIdleHours")
 
         let settings = AppSettings(defaults: defaults)
         settings.migrateLegacyIdleDurationIfNeeded(appName: "Safari", bundleId: "com.apple.Safari")
 
-        XCTAssertEqual(settings.idleMinutesOverride(forAppKey: "com.apple.Safari"), 240)
+        XCTAssertEqual(settings.idleMinutesOverride(forAppKey: "com.apple.Safari"), 360)
         XCTAssertNil(defaults.data(forKey: "com.MagicQuit.appIdleHours"))
     }
 
